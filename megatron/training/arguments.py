@@ -454,6 +454,13 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
+        assert not (args.rl_use_sequence_packing and args.prefix_tree_merging), (
+            "--prefix-tree-merging is currently wired only for the unpacked RL path; "
+            "do not enable it together with --rl-use-sequence-packing."
+        )
+
+    if args.prefix_tree_merging:
+        assert args.perform_rl_step, "--prefix-tree-merging is currently only supported with --perform-rl-step"
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2334,6 +2341,9 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--prefix-tree-merging', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Enable the Prefix Tree Merging RL control-flow path. '
+                            'Current implementation is dummy wiring only and logs when the path is exercised.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,

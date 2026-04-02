@@ -21,6 +21,7 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.rl.prefix_tree_merging_utils import log_dummy_prefix_tree_path
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args
@@ -257,6 +258,15 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
+    prefix_tree_context = runtime_state.prefix_tree_context if args.prefix_tree_merging else None
+
+    if prefix_tree_context is not None:
+        log_dummy_prefix_tree_path(
+            stage="train-forward-batch",
+            context=prefix_tree_context,
+            tokens=tokens,
+            position_ids=position_ids,
+        )
 
     if packed_seq_params is None:
         if args.rl_use_sequence_packing:
@@ -290,7 +300,9 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
+            packed_seq_params=packed_seq_params,
+            prefix_tree_context=prefix_tree_context,
+            prefix_tree_stage="train-forward",
         )
 
         if not is_pipeline_last_stage():

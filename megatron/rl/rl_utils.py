@@ -59,6 +59,11 @@ from megatron.rl.sequence_packing_utils import (
     get_default_packed_seq_params,
     update_microbatch_calculator,
 )
+from megatron.rl.prefix_tree_merging_utils import (
+    PrefixTreeMergingContext,
+    build_dummy_prefix_tree_context,
+    log_dummy_prefix_tree_path,
+)
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -298,6 +303,7 @@ class RLRuntimeState:
 
     def __init__(self):
         self.packing_context = None
+        self.prefix_tree_context = None
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
@@ -637,7 +643,16 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    prefix_tree_stage: str | None = None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -688,6 +703,14 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
 
             attention_mask_for_forward = None
+
+            if prefix_tree_context is not None and prefix_tree_stage is not None:
+                log_dummy_prefix_tree_path(
+                    stage=prefix_tree_stage,
+                    context=prefix_tree_context,
+                    tokens=tokens,
+                    position_ids=position_ids,
+                )
 
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
@@ -1164,7 +1187,14 @@ def prepare_trajectories(
     return trajs, generation_masks, inference_logprobs
 
 
-def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
+def logprobs_forward_step(
+    data_iterator,
+    model,
+    is_correction,
+    packing_context=None,
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    log_stage: str = "logprobs",
+):
     # Avoid self.training checks which will trigger cudagraph capture; this path reuses
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
@@ -1188,6 +1218,8 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
+            prefix_tree_context=prefix_tree_context,
+            prefix_tree_stage=log_stage if prefix_tree_context is not None else None,
         ),
         None,
     )
@@ -1207,6 +1239,8 @@ def compute_logprobs_batch(
     dtype,
     pp_group,
     is_correction,
+    prefix_tree_context=None,
+    log_stage="logprobs",
     collect_non_loss_data=False,
 ):
     """Compute logprobs for all batches in the data loader."""
@@ -1214,7 +1248,13 @@ def compute_logprobs_batch(
     data_iterator = iter(data_loader)
     for i in range(len(data_loader)):
         output_tensor = forward_backward_func(
-            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context),
+            forward_step_func=partial(
+                logprobs_forward_step,
+                is_correction=is_correction,
+                packing_context=packing_context,
+                prefix_tree_context=prefix_tree_context,
+                log_stage=log_stage,
+            ),
             data_iterator=data_iterator,
             model=model,
             num_microbatches=1,
@@ -1250,8 +1290,9 @@ def prepare_data_for_update(
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
-    sequence_packing: bool,
-    is_correction: bool,
+    prefix_tree_merging: bool = False,
+    sequence_packing: bool = False,
+    is_correction: bool = False,
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -1260,6 +1301,7 @@ def prepare_data_for_update(
         ref_state_dict: Reference policy state dict.
         rollouts: Rollouts to extract the data from.
         tokenizer: Tokenizer to pad/tokenize data.
+        prefix_tree_merging: Use dummy Prefix Tree Merging control flow if True.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
 
@@ -1324,6 +1366,13 @@ def prepare_data_for_update(
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
+
+        prefix_tree_context = None
+        runtime_state.prefix_tree_context = None
+        if prefix_tree_merging:
+            with nvtx_range("rl/prefix-tree-merging-dummy-build", time=True):
+                prefix_tree_context = build_dummy_prefix_tree_context(trajs, generation_masks)
+                runtime_state.prefix_tree_context = prefix_tree_context
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
@@ -1390,6 +1439,7 @@ def prepare_data_for_update(
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
                     packing_context=packing_context,
+                    prefix_tree_context=prefix_tree_context,
                     trajs_batch_size=len(compute_trajs),
                     seq_length=args.seq_length,
                     logprobs_batch_size=logprobs_batch_size,
@@ -1397,6 +1447,7 @@ def prepare_data_for_update(
                     dtype=dtype,
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    log_stage="old-logprobs",
                 )
 
             with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
@@ -1410,6 +1461,7 @@ def prepare_data_for_update(
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
                     packing_context=packing_context,
+                    prefix_tree_context=prefix_tree_context,
                     trajs_batch_size=len(compute_trajs),
                     seq_length=args.seq_length,
                     logprobs_batch_size=logprobs_batch_size,
@@ -1417,6 +1469,7 @@ def prepare_data_for_update(
                     dtype=dtype,
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    log_stage="ref-logprobs",
                 )
 
                 # logprobs are [b, seq, h] now.
@@ -1537,8 +1590,9 @@ def get_grpo_data_iterator(
     grpo_prompts_per_step: int,
     grpo_group_size: int,
     global_batch_size: int,
-    sequence_packing: bool,
-    is_correction: bool,
+    prefix_tree_merging: bool = False,
+    sequence_packing: bool = False,
+    is_correction: bool = False,
     buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
@@ -1556,6 +1610,7 @@ def get_grpo_data_iterator(
         grpo_prompts_per_step: How many prompts we sample per data collection.
         grpo_group_size: How many samples we do per prompt.
         global_batch_size: Global batch size.
+        prefix_tree_merging: Use dummy Prefix Tree Merging control flow if True.
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
@@ -1582,6 +1637,7 @@ def get_grpo_data_iterator(
             ref_state_dict=ref_state_dict,
             rollouts=rollouts,
             tokenizer=tokenizer,
+            prefix_tree_merging=prefix_tree_merging,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
