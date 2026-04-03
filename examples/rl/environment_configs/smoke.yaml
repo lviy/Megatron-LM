@@ -1,0 +1,5 @@
+- agent_type: examples.rl.environments.smoke.smoke_agent.SmokeAgent
+  agent_args:
+    prompt: "Answer with HELLO."
+    expected_substring: "HELLO"
+  weight: 1.0
