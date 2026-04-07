@@ -1,0 +1,23 @@
+{
+  "dataset_name": "grpo_agentic_rollout_mock",
+  "ai_generated": true,
+  "created_at_utc": "2026-04-07T03:59:17.596612+00:00",
+  "group_size": 16,
+  "num_groups": 4,
+  "num_rollouts_total": 64,
+  "files": {
+    "grouped_jsonl": "examples/rl/data/grpo_rollout_ai_generated/grpo_grouped_rollouts_4x16.jsonl",
+    "flat_jsonl": "examples/rl/data/grpo_rollout_ai_generated/grpo_flat_rollouts_64.jsonl"
+  },
+  "notes": [
+    "Synthetic dataset generated for local simulation only.",
+    "Field design mimics common Agentic RL and GRPO rollout schemas.",
+    "Do not treat rewards/logprobs/tool traces as real training data."
+  ],
+  "reference_format_sources": [
+    "https://huggingface.co/docs/trl/en/grpo_trainer",
+    "https://huggingface.co/docs/trl/openenv",
+    "https://huggingface.co/datasets/hkust-nlp/Toolathlon-Trajectories",
+    "https://huggingface.co/datasets/ernie-research/MEnvData-SWE-Trajectory"
+  ]
+}
