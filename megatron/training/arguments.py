@@ -441,6 +441,13 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.seq_length <= args.rl_sequence_packing_bin_size, \
                 f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
+        assert not (args.rl_use_sequence_packing and args.prefix_tree_merging), (
+            "--prefix-tree-merging is currently wired only for the unpacked RL path; "
+            "do not enable it together with --rl-use-sequence-packing."
+        )
+
+    if args.prefix_tree_merging:
+        assert args.perform_rl_step, "--prefix-tree-merging is currently only supported with --perform-rl-step"
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -2113,6 +2120,9 @@ def _add_rl_args(parser):
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, calculate the intra-group similarity of rollouts.')
+    group.add_argument('--prefix-tree-merging', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Enable the Prefix Tree Merging RL control-flow path. '
+                            'Current implementation is dummy wiring only and logs when the path is exercised.')
     group.add_argument('--rl-use-sequence-packing', action='store_true',
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-bin-size', type=int, default=8192,

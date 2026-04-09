@@ -2455,7 +2455,12 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                    model,
+                    optimizer,
+                    iteration,
+                    ref_state_dict,
+                    prefix_tree_merging=args.prefix_tree_merging,
+                    buffered_rollouts=buffered_rollouts,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
