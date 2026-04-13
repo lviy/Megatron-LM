@@ -62,6 +62,14 @@ except ImportError:
     te = MagicMock()
     HAVE_TE = False
 
+try:
+    from magi_attention.functional.flex_flash_attn import flex_flash_attn_func as magi_flex_flash_attn_func
+
+    HAVE_MAGI_ATTENTION = True
+except ImportError:
+    magi_flex_flash_attn_func = None
+    HAVE_MAGI_ATTENTION = False
+
 
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
@@ -1005,6 +1013,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
         )
+        # PTM fields are consumed by Megatron wrapper and must not be forwarded to TE.
+        self.kept_packed_seq_params.discard("ptm_q_ranges")
+        self.kept_packed_seq_params.discard("ptm_k_ranges")
+        self.kept_packed_seq_params.discard("ptm_attn_type_map")
 
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
@@ -1045,6 +1057,30 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+    def _forward_magi_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tensor:
+        if not HAVE_MAGI_ATTENTION:
+            raise RuntimeError(
+                "PTM TreeMask path requires magi_attention package, but import failed. "
+                "Please install MagiAttention in the Megatron runtime environment."
+            )
+
+        core_attn_out, _ = magi_flex_flash_attn_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            q_ranges=packed_seq_params.ptm_q_ranges,
+            k_ranges=packed_seq_params.ptm_k_ranges,
+            attn_type_map=packed_seq_params.ptm_attn_type_map,
+            deterministic=self.config.deterministic_mode,
+        )
+        return core_attn_out
+
     def forward(
         self,
         query: Tensor,
@@ -1081,6 +1117,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+        ptm_q_ranges = getattr(packed_seq_params, "ptm_q_ranges", None) if packed_seq_params is not None else None
+        ptm_k_ranges = getattr(packed_seq_params, "ptm_k_ranges", None) if packed_seq_params is not None else None
+        ptm_attn_type_map = (
+            getattr(packed_seq_params, "ptm_attn_type_map", None) if packed_seq_params is not None else None
+        )
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -1091,6 +1132,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             attention_bias_kwargs = dict(
                 core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
             )
+
+        if (
+            qkv_format == "thd"
+            and ptm_q_ranges is not None
+            and ptm_k_ranges is not None
+            and ptm_attn_type_map is not None
+        ):
+            if attention_bias is not None:
+                raise RuntimeError("PTM TreeMask path currently does not support attention_bias.")
+            return self._forward_magi_attention(query, key, value, packed_seq_params)
 
         if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
             if (qkv_format == "bshd" and query.size(1) == 1) or (

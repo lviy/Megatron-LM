@@ -21,3 +21,7 @@ class PackedSeqParams:
     max_seqlen_kv: int = None
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    # Optional PTM TreeMask metadata for MagiAttention path.
+    ptm_q_ranges: Tensor = None
+    ptm_k_ranges: Tensor = None
+    ptm_attn_type_map: Tensor = None

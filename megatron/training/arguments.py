@@ -169,6 +169,24 @@ def validate_model_config_args_from_heterogeneous_config(args):
     ]
     assert all(num == n_kv_heads_in_group[0] for num in n_kv_heads_in_group), "num query head must be consistent across all layers"
 
+    rope_params = getattr(hf_config_dict, "rope_parameters", None)
+    rope_scaling = getattr(hf_config_dict, "rope_scaling", None)
+    rope_theta = getattr(hf_config_dict, "rope_theta", None)
+    if rope_theta is None and isinstance(rope_params, dict):
+        rope_theta = rope_params.get("rope_theta")
+    if rope_theta is None and isinstance(rope_scaling, dict):
+        rope_theta = rope_scaling.get("rope_theta")
+    if rope_theta is None:
+        rope_theta = 10000.0
+
+    rope_scaling_factor = None
+    if isinstance(rope_scaling, dict):
+        rope_scaling_factor = rope_scaling.get("factor")
+    if rope_scaling_factor is None and isinstance(rope_params, dict):
+        rope_scaling_factor = rope_params.get("factor")
+    if rope_scaling_factor is None:
+        rope_scaling_factor = 8.0
+
     args_to_validate = {
         "swiglu": True,
         "normalization": "RMSNorm",
@@ -181,8 +199,8 @@ def validate_model_config_args_from_heterogeneous_config(args):
         "hidden_size": hf_config_dict.hidden_size,
         "num_attention_heads": hf_config_dict.num_attention_heads,
         "untie_embeddings_and_output_weights": not hf_config_dict.tie_word_embeddings,
-        "rotary_base": hf_config_dict.rope_theta,
-        "rope_scaling_factor": hf_config_dict.rope_scaling["factor"],
+        "rotary_base": rope_theta,
+        "rope_scaling_factor": rope_scaling_factor,
         "num_query_groups": hf_config_dict.num_attention_heads // n_kv_heads_in_group[0],
     }
 
