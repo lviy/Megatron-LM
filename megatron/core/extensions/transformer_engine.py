@@ -1106,12 +1106,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self._magi_ptm_log_emitted = True
 
         core_attn_out, _ = magi_flex_flash_attn_func(
-            q=query.contiguous(),
-            k=key.contiguous(),
-            v=value.contiguous(),
+            q=query,
+            k=key,
+            v=value,
             q_ranges=packed_seq_params.ptm_q_ranges,
             k_ranges=packed_seq_params.ptm_k_ranges,
             attn_type_map=packed_seq_params.ptm_attn_type_map,
+            disable_fwd_atomic_reduction=True,
             deterministic=self.config.deterministic_mode,
         )
         return core_attn_out
