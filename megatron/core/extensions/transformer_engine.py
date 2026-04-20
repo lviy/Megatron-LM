@@ -3,6 +3,7 @@
 import dataclasses
 import inspect
 import io
+import logging
 import os
 import pickle
 import warnings
@@ -69,6 +70,8 @@ try:
 except ImportError:
     magi_flex_flash_attn_func = None
     HAVE_MAGI_ATTENTION = False
+
+logger = logging.getLogger(__name__)
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -1056,6 +1059,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             layer_number=layer_number,
             **extra_kwargs,
         )
+        self._magi_ptm_log_emitted = False
 
     def _forward_magi_attention(
         self,
@@ -1069,6 +1073,37 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "PTM TreeMask path requires magi_attention package, but import failed. "
                 "Please install MagiAttention in the Megatron runtime environment."
             )
+
+        if (
+            not self._magi_ptm_log_emitted
+            and os.environ.get("SLIME_PTM_LOGPROB_BREAKDOWN", "0").strip().lower() in {"1", "true", "yes"}
+        ):
+            ptm_q_ranges = packed_seq_params.ptm_q_ranges
+            ptm_k_ranges = packed_seq_params.ptm_k_ranges
+            total_q_slice_tokens = int((ptm_q_ranges[:, 1] - ptm_q_ranges[:, 0]).sum().item())
+            total_k_slice_tokens = int((ptm_k_ranges[:, 1] - ptm_k_ranges[:, 0]).sum().item())
+            logger.info(
+                "[PTMProfile] component=magi_attention_call q_shape=%s k_shape=%s v_shape=%s "
+                "q_stride=%s k_stride=%s v_stride=%s q_is_contiguous=%s k_is_contiguous=%s "
+                "v_is_contiguous=%s num_q_ranges=%d num_k_ranges=%d total_q_slice_tokens=%d "
+                "total_k_slice_tokens=%d max_seqlen_q=%s max_seqlen_kv=%s",
+                tuple(query.shape),
+                tuple(key.shape),
+                tuple(value.shape),
+                tuple(query.stride()),
+                tuple(key.stride()),
+                tuple(value.stride()),
+                query.is_contiguous(),
+                key.is_contiguous(),
+                value.is_contiguous(),
+                ptm_q_ranges.size(0),
+                ptm_k_ranges.size(0),
+                total_q_slice_tokens,
+                total_k_slice_tokens,
+                packed_seq_params.max_seqlen_q,
+                packed_seq_params.max_seqlen_kv,
+            )
+            self._magi_ptm_log_emitted = True
 
         core_attn_out, _ = magi_flex_flash_attn_func(
             q=query.contiguous(),
