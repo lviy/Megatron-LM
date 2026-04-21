@@ -1020,6 +1020,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("ptm_q_ranges")
         self.kept_packed_seq_params.discard("ptm_k_ranges")
         self.kept_packed_seq_params.discard("ptm_attn_type_map")
+        self.kept_packed_seq_params.discard("ptm_q_ranges_non_overlapped")
         self.kept_packed_seq_params.discard("explicit_position_ids")
 
         if get_te_version() < PkgVersion("1.3.0"):
