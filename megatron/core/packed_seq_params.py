@@ -25,3 +25,5 @@ class PackedSeqParams:
     ptm_q_ranges: Tensor = None
     ptm_k_ranges: Tensor = None
     ptm_attn_type_map: Tensor = None
+    ptm_q_ranges_non_overlapped: bool | None = None
+    explicit_position_ids: bool | None = None

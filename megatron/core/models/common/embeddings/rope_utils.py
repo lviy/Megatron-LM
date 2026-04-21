@@ -254,6 +254,7 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    force_unfused: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -265,7 +266,7 @@ def apply_rotary_pos_emb(
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
 
-    if config.apply_rope_fusion:
+    if config.apply_rope_fusion and not force_unfused:
         if cu_seqlens is None:
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False

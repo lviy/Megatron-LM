@@ -147,6 +147,24 @@ class RotaryEmbedding(nn.Module):
         sin = torch.sin(freqs)
         return cos, sin
 
+    def _get_freqs_from_position_ids(self, position_ids: Tensor) -> Tensor:
+        """Generate per-token rotary frequencies for explicit position ids."""
+        if self.inv_freq.device.type == 'cpu':
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+
+        seq = position_ids.to(device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        if seq.dim() == 1:
+            seq = seq.unsqueeze(0)
+        elif seq.dim() != 2:
+            raise ValueError(f"Expected position_ids to have shape [batch, seq], got {tuple(seq.shape)}")
+
+        if self.seq_len_interpolation_factor is not None:
+            seq *= 1 / self.seq_len_interpolation_factor
+
+        # [batch, seq, dim/2] -> [seq, batch, dim/2]
+        freqs = (seq.unsqueeze(-1) * self.inv_freq.view(1, 1, -1)).transpose(0, 1).contiguous()
+        return freqs
+
     @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of RoPE embedding before CP sharding.
@@ -200,6 +218,29 @@ class RotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+
+        return emb
+
+    @internal_api
+    def forward_with_position_ids(
+        self, position_ids: Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Tensor:
+        """Forward pass of RoPE embedding for explicit per-token position ids."""
+        freqs = self._get_freqs_from_position_ids(position_ids)
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs, freqs), dim=-1).view(*freqs.shape[:-1], -1)
+        emb = emb.unsqueeze(2)
+
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            cp_group = packed_seq_params.cp_group
+        else:
+            cp_group = self.cp_group
+
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb

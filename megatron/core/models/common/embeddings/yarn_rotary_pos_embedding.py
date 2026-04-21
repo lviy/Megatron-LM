@@ -184,6 +184,51 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
+    @internal_api
+    def forward_with_position_ids(
+        self, position_ids: Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> tuple[Tensor, float]:
+        """Forward pass of Yarn RoPE for explicit per-token position ids."""
+        low, high = _yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            self.dim,
+            self.rotary_base,
+            self.original_max_position_embeddings,
+            self.correction_range_round_to_int,
+        )
+        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
+            low, high, self.dim // 2, device=self.inv_freq_extra.device
+        ).to(dtype=torch.float32)
+        inv_freq = self.inv_freq_inter * (1 - inv_freq_mask) + self.inv_freq_extra * inv_freq_mask
+
+        if self.inv_freq_extra.device.type == 'cpu':
+            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
+        if self.inv_freq_inter.device.type == 'cpu':
+            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
+            inv_freq = inv_freq.to(device=torch.cuda.current_device())
+
+        seq = position_ids.to(device=inv_freq.device, dtype=inv_freq.dtype)
+        if seq.dim() == 1:
+            seq = seq.unsqueeze(0)
+        elif seq.dim() != 2:
+            raise ValueError(f"Expected position_ids to have shape [batch, seq], got {tuple(seq.shape)}")
+
+        freqs = (seq.unsqueeze(-1) * inv_freq.view(1, 1, -1)).transpose(0, 1).contiguous()
+        _mscale = _yarn_get_concentration_factor(
+            self.scaling_factor, self.mscale, self.mscale_all_dim
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(2)
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            cp_group = packed_seq_params.cp_group
+        else:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+        return emb, _mscale
+
     def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq_params=None):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset

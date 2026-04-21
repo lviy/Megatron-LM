@@ -1020,6 +1020,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("ptm_q_ranges")
         self.kept_packed_seq_params.discard("ptm_k_ranges")
         self.kept_packed_seq_params.discard("ptm_attn_type_map")
+        self.kept_packed_seq_params.discard("explicit_position_ids")
 
         if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
@@ -1080,13 +1081,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         ):
             ptm_q_ranges = packed_seq_params.ptm_q_ranges
             ptm_k_ranges = packed_seq_params.ptm_k_ranges
+            q_ranges_non_overlapped = bool(getattr(packed_seq_params, "ptm_q_ranges_non_overlapped", False))
+            disable_fwd_atomic_reduction = q_ranges_non_overlapped
             total_q_slice_tokens = int((ptm_q_ranges[:, 1] - ptm_q_ranges[:, 0]).sum().item())
             total_k_slice_tokens = int((ptm_k_ranges[:, 1] - ptm_k_ranges[:, 0]).sum().item())
             logger.info(
                 "[PTMProfile] component=magi_attention_call q_shape=%s k_shape=%s v_shape=%s "
                 "q_stride=%s k_stride=%s v_stride=%s q_is_contiguous=%s k_is_contiguous=%s "
                 "v_is_contiguous=%s num_q_ranges=%d num_k_ranges=%d total_q_slice_tokens=%d "
-                "total_k_slice_tokens=%d max_seqlen_q=%s max_seqlen_kv=%s",
+                "total_k_slice_tokens=%d q_ranges_non_overlapped=%s "
+                "disable_fwd_atomic_reduction=%s max_seqlen_q=%s max_seqlen_kv=%s",
                 tuple(query.shape),
                 tuple(key.shape),
                 tuple(value.shape),
@@ -1100,11 +1104,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 ptm_k_ranges.size(0),
                 total_q_slice_tokens,
                 total_k_slice_tokens,
+                q_ranges_non_overlapped,
+                disable_fwd_atomic_reduction,
                 packed_seq_params.max_seqlen_q,
                 packed_seq_params.max_seqlen_kv,
             )
             self._magi_ptm_log_emitted = True
 
+        disable_fwd_atomic_reduction = bool(getattr(packed_seq_params, "ptm_q_ranges_non_overlapped", False))
         core_attn_out, _ = magi_flex_flash_attn_func(
             q=query,
             k=key,
@@ -1112,7 +1119,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             q_ranges=packed_seq_params.ptm_q_ranges,
             k_ranges=packed_seq_params.ptm_k_ranges,
             attn_type_map=packed_seq_params.ptm_attn_type_map,
-            disable_fwd_atomic_reduction=True,
+            disable_fwd_atomic_reduction=disable_fwd_atomic_reduction,
             deterministic=self.config.deterministic_mode,
         )
         return core_attn_out

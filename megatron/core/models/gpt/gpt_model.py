@@ -312,6 +312,11 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        use_explicit_position_ids = bool(
+            packed_seq_params is not None
+            and getattr(packed_seq_params, 'explicit_position_ids', False)
+            and position_ids is not None
+        )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -339,6 +344,12 @@ class GPTModel(LanguageModule):
                             -1,
                         ),
                     )
+            elif use_explicit_position_ids:
+                # PTM merged batches reorder tokens into trie DFS order, so default 0..T-1 RoPE
+                # positions are incorrect. Keep original per-token positions from the source batch.
+                rotary_pos_emb = self.rotary_pos_emb.forward_with_position_ids(
+                    position_ids, packed_seq_params=packed_seq_params
+                )
             else:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -348,12 +359,17 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
-                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-                )
-                rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
-                )
+                if use_explicit_position_ids:
+                    rotary_pos_emb, _ = self.rotary_pos_emb.forward_with_position_ids(
+                        position_ids, packed_seq_params=packed_seq_params
+                    )
+                else:
+                    rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                        inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                    )
+                    rotary_pos_emb, _ = self.rotary_pos_emb(
+                        rotary_seq_len, packed_seq_params=packed_seq_params
+                    )
             else:
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
