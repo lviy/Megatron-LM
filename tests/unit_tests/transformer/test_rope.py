@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -93,6 +94,32 @@ class TestRotaryEmbedding:
         assert output.shape[3] == self.kv_channels
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
+
+
+def test_thd_rope_explicit_position_ids_use_token_aligned_freqs():
+    config = TransformerConfig(
+        num_attention_heads=1,
+        num_layers=1,
+        apply_rope_fusion=False,
+        rotary_interleaved=False,
+    )
+    t = torch.randn(6, 2, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+    freqs = torch.randn(6, 1, 1, 8, dtype=torch.float32)
+
+    out = apply_rotary_pos_emb(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=None,
+        force_unfused=True,
+        explicit_position_ids=True,
+    )
+    expected = _apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs).squeeze(1)
+
+    assert out.shape == t.shape
+    assert torch.allclose(out, expected)
 
 
 class TestQKVRotaryEmbedding:

@@ -906,6 +906,10 @@ class Attention(MegatronModule, ABC):
                     or ptm_magi_cp_enabled
                 )
             )
+            explicit_position_ids = bool(
+                packed_seq_params is not None
+                and getattr(packed_seq_params, "explicit_position_ids", False)
+            )
             rope_cp_group = self.pg_collection.cp
             if (
                 packed_seq_params is not None
@@ -941,6 +945,7 @@ class Attention(MegatronModule, ABC):
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=rope_cp_group,
                             force_unfused=force_unfused_rope,
+                            explicit_position_ids=explicit_position_ids,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -955,6 +960,7 @@ class Attention(MegatronModule, ABC):
                         mscale=_yarn_get_concentration_factor_from_config(self.config),
                         cp_group=rope_cp_group,
                         force_unfused=force_unfused_rope,
+                        explicit_position_ids=explicit_position_ids,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(

@@ -183,6 +183,7 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    explicit_position_ids: bool = False,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -196,6 +197,15 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
+
+    if explicit_position_ids and freqs.dim() >= 1 and freqs.size(0) == t.size(0):
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=multi_latent_attention,
+            mscale=mscale,
+        ).squeeze(1)
 
     if cp_group is None:
         cp_size = 1
@@ -257,12 +267,16 @@ def apply_rotary_pos_emb(
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
     force_unfused: bool = False,
+    explicit_position_ids: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
+
+    if explicit_position_ids:
+        force_unfused = True
 
     # Keep for backward compatibility. Will deprecate in the future.
     if cp_group is None and (cu_seqlens is None or not force_unfused):
@@ -313,6 +327,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
+            explicit_position_ids=explicit_position_ids,
         )
 
 
