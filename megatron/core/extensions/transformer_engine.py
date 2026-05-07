@@ -66,8 +66,11 @@ except ImportError:
 try:
     from magi_attention.functional.flex_flash_attn import flex_flash_attn_func as magi_flex_flash_attn_func
 
+    from magi_attention.api import calc_attn as magi_calc_attn
+
     HAVE_MAGI_ATTENTION = True
 except ImportError:
+    magi_calc_attn = None
     magi_flex_flash_attn_func = None
     HAVE_MAGI_ATTENTION = False
 
@@ -1021,6 +1024,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("ptm_k_ranges")
         self.kept_packed_seq_params.discard("ptm_attn_type_map")
         self.kept_packed_seq_params.discard("ptm_q_ranges_non_overlapped")
+        self.kept_packed_seq_params.discard("ptm_magi_dist_key")
+        self.kept_packed_seq_params.discard("ptm_magi_cp_enabled")
+        self.kept_packed_seq_params.discard("ptm_magi_global_seqlen")
+        self.kept_packed_seq_params.discard("ptm_magi_pad_size")
+        self.kept_packed_seq_params.discard("ptm_magi_chunk_size")
         self.kept_packed_seq_params.discard("explicit_position_ids")
 
         if get_te_version() < PkgVersion("1.3.0"):
@@ -1078,7 +1086,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if (
             not self._magi_ptm_log_emitted
-            and os.environ.get("SLIME_PTM_LOGPROB_BREAKDOWN", "0").strip().lower() in {"1", "true", "yes"}
+            and os.environ.get("SLIME_PTM_DEBUG", "0").strip().lower() in {"1", "true", "yes"}
         ):
             ptm_q_ranges = packed_seq_params.ptm_q_ranges
             ptm_k_ranges = packed_seq_params.ptm_k_ranges
@@ -1112,17 +1120,29 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             self._magi_ptm_log_emitted = True
 
-        disable_fwd_atomic_reduction = bool(getattr(packed_seq_params, "ptm_q_ranges_non_overlapped", False))
-        core_attn_out, _ = magi_flex_flash_attn_func(
-            q=query,
-            k=key,
-            v=value,
-            q_ranges=packed_seq_params.ptm_q_ranges,
-            k_ranges=packed_seq_params.ptm_k_ranges,
-            attn_type_map=packed_seq_params.ptm_attn_type_map,
-            disable_fwd_atomic_reduction=disable_fwd_atomic_reduction,
-            deterministic=self.config.deterministic_mode,
-        )
+        magi_dist_key = getattr(packed_seq_params, "ptm_magi_dist_key", None)
+        if magi_dist_key is not None:
+            core_attn_out, _ = magi_calc_attn(
+                query,
+                key,
+                value,
+                magi_dist_key,
+                softmax_scale=getattr(self, "softmax_scale", None),
+            )
+        else:
+            disable_fwd_atomic_reduction = bool(
+                getattr(packed_seq_params, "ptm_q_ranges_non_overlapped", False)
+            )
+            core_attn_out, _ = magi_flex_flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                q_ranges=packed_seq_params.ptm_q_ranges,
+                k_ranges=packed_seq_params.ptm_k_ranges,
+                attn_type_map=packed_seq_params.ptm_attn_type_map,
+                disable_fwd_atomic_reduction=disable_fwd_atomic_reduction,
+                deterministic=self.config.deterministic_mode,
+            )
         return core_attn_out
 
     def forward(

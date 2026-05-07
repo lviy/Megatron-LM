@@ -26,4 +26,9 @@ class PackedSeqParams:
     ptm_k_ranges: Tensor = None
     ptm_attn_type_map: Tensor = None
     ptm_q_ranges_non_overlapped: bool | None = None
+    ptm_magi_dist_key: object = None
+    ptm_magi_cp_enabled: bool | None = None
+    ptm_magi_global_seqlen: int | None = None
+    ptm_magi_pad_size: int | None = None
+    ptm_magi_chunk_size: int | None = None
     explicit_position_ids: bool | None = None

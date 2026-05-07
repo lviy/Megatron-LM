@@ -198,9 +198,11 @@ def _apply_rotary_pos_emb_thd(
     """
 
     if cp_group is None:
-        raise ValueError("cp_group must be provided for THD format RoPE")
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+        cp_size = 1
+        cp_rank = 0
+    else:
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
     # Handle two different frequency tensor formats:
@@ -263,7 +265,7 @@ def apply_rotary_pos_emb(
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
     # Keep for backward compatibility. Will deprecate in the future.
-    if cp_group is None:
+    if cp_group is None and (cu_seqlens is None or not force_unfused):
         cp_group = parallel_state.get_context_parallel_group()
 
     if config.apply_rope_fusion and not force_unfused:
@@ -288,8 +290,10 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            cp_size = cp_group.size() if cp_group is not None else 1
+            cp_rank = cp_group.rank() if cp_group is not None else 0
             return fused_apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+                t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_rank
             )
     # use unfused implementation
     if cu_seqlens is None:
