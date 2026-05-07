@@ -1143,6 +1143,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 disable_fwd_atomic_reduction=disable_fwd_atomic_reduction,
                 deterministic=self.config.deterministic_mode,
             )
+        core_attn_out = core_attn_out.contiguous()
+        if os.environ.get("SLIME_PTM_DEBUG", "0").strip().lower() in {"1", "true", "yes"}:
+            logger.info(
+                "[PTMProfile] component=magi_attention_out out_shape=%s out_stride=%s out_is_contiguous=%s",
+                tuple(core_attn_out.shape),
+                tuple(core_attn_out.stride()),
+                core_attn_out.is_contiguous(),
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         return core_attn_out
 
     def forward(
