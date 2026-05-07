@@ -892,11 +892,29 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
+            ptm_magi_dist_key = (
+                getattr(packed_seq_params, "ptm_magi_dist_key", None) if packed_seq_params is not None else None
+            )
+            ptm_magi_cp_enabled = bool(
+                packed_seq_params is not None and getattr(packed_seq_params, "ptm_magi_cp_enabled", False)
+            )
             force_unfused_rope = bool(
-                packed_seq_params is not None and getattr(packed_seq_params, "explicit_position_ids", False)
+                packed_seq_params is not None
+                and (
+                    getattr(packed_seq_params, "explicit_position_ids", False)
+                    or ptm_magi_dist_key is not None
+                    or ptm_magi_cp_enabled
+                )
             )
             rope_cp_group = self.pg_collection.cp
-            if packed_seq_params is not None and getattr(packed_seq_params, "local_cp_size", None) == 1:
+            if (
+                packed_seq_params is not None
+                and (
+                    getattr(packed_seq_params, "local_cp_size", None) == 1
+                    or ptm_magi_dist_key is not None
+                    or ptm_magi_cp_enabled
+                )
+            ):
                 rope_cp_group = None
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
