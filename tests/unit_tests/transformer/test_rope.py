@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -119,6 +120,81 @@ def test_thd_rope_explicit_position_ids_use_token_aligned_freqs():
     expected = _apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs).squeeze(1)
 
     assert out.shape == t.shape
+    assert torch.allclose(out, expected)
+
+
+def test_thd_rope_explicit_position_ids_use_tensor_parallel_sequence_shard(monkeypatch):
+    from megatron.core.models.common.embeddings import rope_utils
+
+    class _FakeTPGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 1
+
+    monkeypatch.setattr(
+        rope_utils.parallel_state,
+        "get_tensor_model_parallel_group",
+        lambda check_initialized=False: _FakeTPGroup(),
+    )
+
+    config = TransformerConfig(
+        num_attention_heads=1,
+        num_layers=1,
+        apply_rope_fusion=False,
+        rotary_interleaved=False,
+    )
+    t = torch.randn(3, 2, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 6], dtype=torch.int32)
+    freqs = torch.randn(6, 1, 1, 8, dtype=torch.float32)
+
+    out = apply_rotary_pos_emb(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=None,
+        force_unfused=True,
+        explicit_position_ids=True,
+    )
+    expected = _apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs[3:6]).squeeze(1)
+
+    assert out.shape == t.shape
+    assert torch.allclose(out, expected)
+
+
+def test_rotary_embedding_uses_magi_position_ids_for_nonpacked_cp(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding as rotary_mod
+
+    class _FakeCPGroup:
+        def size(self):
+            return 2
+
+    monkeypatch.setattr(
+        rotary_mod.parallel_state,
+        "get_context_parallel_group",
+        lambda check_initialized=False: _FakeCPGroup(),
+    )
+
+    rope = RotaryEmbedding(8, 1.0, use_cpu_initialization=True)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="sbhd",
+        ptm_magi_dist_key=object(),
+    )
+
+    fake_indices = torch.tensor([1, 3, 5], dtype=torch.long)
+    expected = rope.get_emb(8)[fake_indices]
+
+    monkeypatch.setattr(
+        rotary_mod,
+        "get_pos_emb_on_this_cp_rank_magi",
+        lambda pos_emb, magi_attention_key: pos_emb[fake_indices],
+    )
+
+    out = rope(8, packed_seq_params=packed_seq_params)
+
+    assert out.shape == expected.shape
     assert torch.allclose(out, expected)
 
 

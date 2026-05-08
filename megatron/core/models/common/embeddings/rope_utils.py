@@ -42,6 +42,7 @@ __all__ = [
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
     'get_pos_emb_on_this_cp_rank',
+    'get_pos_emb_on_this_cp_rank_magi',
 ]
 
 
@@ -68,6 +69,23 @@ def get_pos_emb_on_this_cp_rank(
     pos_emb = pos_emb.index_select(seq_dim, cp_idx)
     pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
     return pos_emb
+
+
+def get_pos_emb_on_this_cp_rank_magi(pos_emb: Tensor, magi_attention_key: object) -> Tensor:
+    """Get the position embedding on the current Magi-dispatched CP rank.
+
+    This follows the official Megatron-LM-MagiAttention integration: Magi runtime metadata
+    owns the local token order, so rotary embeddings should be sliced by Magi's position ids
+    instead of native zigzag CP rank formulas.
+
+    Args:
+        pos_emb (Tensor): Positional embedding tensor with sequence on dim 0.
+        magi_attention_key (object): Magi runtime key used to recover local position ids.
+    """
+    from magi_attention.api import get_position_ids
+
+    cp_idx = get_position_ids(magi_attention_key)
+    return pos_emb[cp_idx]
 
 
 def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
@@ -198,7 +216,20 @@ def _apply_rotary_pos_emb_thd(
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
 
-    if explicit_position_ids and freqs.dim() >= 1 and freqs.size(0) == t.size(0):
+    if explicit_position_ids:
+        if freqs.size(0) != t.size(0):
+            tp_group = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
+            tp_size = tp_group.size() if tp_group is not None else 1
+            tp_rank = tp_group.rank() if tp_group is not None else 0
+            if tp_size > 1 and freqs.size(0) == t.size(0) * tp_size:
+                dim_offset = tp_rank * t.size(0)
+                freqs = freqs[dim_offset : dim_offset + t.size(0)]
+            else:
+                raise ValueError(
+                    "Explicit-position THD RoPE expects freqs to be token-aligned with t "
+                    f"or a tensor-parallel sequence shard: freqs.size(0)={freqs.size(0)}, "
+                    f"t.size(0)={t.size(0)}, tp_size={tp_size}."
+                )
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),
             freqs,

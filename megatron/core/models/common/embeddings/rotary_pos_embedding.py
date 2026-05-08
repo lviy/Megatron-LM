@@ -24,6 +24,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     _rotate_half,
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
+    get_pos_emb_on_this_cp_rank_magi,
 )
 from megatron.core.utils import deprecate_inference_params, internal_api
 
@@ -216,9 +217,17 @@ class RotaryEmbedding(nn.Module):
             cp_group = self.cp_group
 
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            # For native zigzag CP, RoPE slicing follows CP rank formulas.
+            # For Magi-dispatched CP, local token order is owned by Magi runtime metadata.
+            ptm_magi_dist_key = (
+                getattr(packed_seq_params, 'ptm_magi_dist_key', None)
+                if packed_seq_params is not None
+                else None
+            )
+            if ptm_magi_dist_key is not None:
+                emb = get_pos_emb_on_this_cp_rank_magi(emb, ptm_magi_dist_key)
+            else:
+                emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb
 
@@ -241,7 +250,15 @@ class RotaryEmbedding(nn.Module):
             cp_group = self.cp_group
 
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            ptm_magi_dist_key = (
+                getattr(packed_seq_params, 'ptm_magi_dist_key', None)
+                if packed_seq_params is not None
+                else None
+            )
+            if ptm_magi_dist_key is not None:
+                emb = get_pos_emb_on_this_cp_rank_magi(emb, ptm_magi_dist_key)
+            else:
+                emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
 
         return emb
 
