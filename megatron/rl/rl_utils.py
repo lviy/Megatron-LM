@@ -32,6 +32,11 @@ from megatron.core.parallel_state import get_tensor_model_parallel_src_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.rl.prefix_tree_merging_utils import (
+    PrefixTreeMergingContext,
+    build_dummy_prefix_tree_context,
+    log_dummy_prefix_tree_path,
+)
 from megatron.rl.agent.api import (
     EvaluationRequest,
     EvaluationResponse,
@@ -94,6 +99,7 @@ class RLRuntimeState:
         self.sequence_packing_plan = None
         self.sequence_packing_metadata = None
         self.packing_context = None
+        self.prefix_tree_context = None
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
 
@@ -701,7 +707,15 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    attention_mask,
+    no_grad=False,
+    prefix_tree_context: PrefixTreeMergingContext | None = None,
+    prefix_tree_stage: str | None = None,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -721,6 +735,13 @@ def get_logprobs(model, tokens, position_ids, attention_mask, no_grad=False):
         with nvtx_range("forward-pass", time=False):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
             args = get_args()
+            if prefix_tree_context is not None and prefix_tree_stage is not None:
+                log_dummy_prefix_tree_path(
+                    stage=prefix_tree_stage,
+                    context=prefix_tree_context,
+                    tokens=tokens,
+                    position_ids=position_ids,
+                )
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
@@ -1160,6 +1181,7 @@ def prepare_data_for_update(
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronLegacyTokenizer,
+    prefix_tree_merging: bool = False,
 ) -> RerunDataIterator:
     """Extract data for the update from raw rollouts.
 
@@ -1168,6 +1190,7 @@ def prepare_data_for_update(
         ref_state_dict: Reference policy state dict.
         rollouts: Rollouts to extract the data from.
         tokenizer: Tokenizer to pad/tokenize data.
+        prefix_tree_merging: Use dummy Prefix Tree Merging control flow if True.
 
     Returns:
         Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
@@ -1224,6 +1247,14 @@ def prepare_data_for_update(
                 trajs, generation_masks, inference_logprobs = prepare_trajectories(
                     rollouts, tokenizer, args.seq_length
                 )
+
+        prefix_tree_context = None
+        runtime_state = get_rl_runtime_state()
+        runtime_state.prefix_tree_context = None
+        if prefix_tree_merging:
+            with nvtx_range("prefix-tree-merging-dummy-build"):
+                prefix_tree_context = build_dummy_prefix_tree_context(trajs, generation_masks)
+                runtime_state.prefix_tree_context = prefix_tree_context
         # Store reference to original data (no clone needed since we don't modify in-place)
         original_trajs = trajs
 
@@ -1638,7 +1669,13 @@ def prepare_data_for_update(
                     b_attn_mask = None
 
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model,
+                    b_trajs.cuda(),
+                    b_posids.cuda(),
+                    b_attn_mask,
+                    no_grad=True,
+                    prefix_tree_context=prefix_tree_context,
+                    prefix_tree_stage="old-logprobs",
                 )
                 old_logprobs.append(logprobs.detach().cpu())
 
@@ -1717,7 +1754,13 @@ def prepare_data_for_update(
                     b_attn_mask = None
 
                 logprobs = get_logprobs(
-                    model, b_trajs.cuda(), b_posids.cuda(), b_attn_mask, no_grad=True
+                    model,
+                    b_trajs.cuda(),
+                    b_posids.cuda(),
+                    b_attn_mask,
+                    no_grad=True,
+                    prefix_tree_context=prefix_tree_context,
+                    prefix_tree_stage="ref-logprobs",
                 )
                 ref_logprobs.append(logprobs.detach().cpu())
 
@@ -1933,6 +1976,7 @@ def get_rollout_data_iterator(
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
+    prefix_tree_merging: bool = False,
 ) -> RerunDataIterator:
 
     args = get_args()
@@ -1941,7 +1985,13 @@ def get_rollout_data_iterator(
     buffered_rollouts = get_environment_rollouts(
         model, optimizer, args.grpo_prompts_per_step, args.grpo_group_size
     )
-    buffered_rollouts = prepare_data_for_update(model, ref_state_dict, buffered_rollouts, tokenizer)
+    buffered_rollouts = prepare_data_for_update(
+        model,
+        ref_state_dict,
+        buffered_rollouts,
+        tokenizer,
+        prefix_tree_merging=prefix_tree_merging,
+    )
 
     return buffered_rollouts
 
@@ -1951,6 +2001,7 @@ def setup_grpo_data_iterator(
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
+    prefix_tree_merging: bool = False,
     buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
@@ -1974,7 +2025,13 @@ def setup_grpo_data_iterator(
         % (args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size))
         == 0
     ):
-        buffered_rollouts = get_rollout_data_iterator(model, optimizer, iteration, ref_state_dict)
+        buffered_rollouts = get_rollout_data_iterator(
+            model,
+            optimizer,
+            iteration,
+            ref_state_dict,
+            prefix_tree_merging=prefix_tree_merging,
+        )
 
         # Reset packing step counter when new rollouts are collected
         runtime_state = get_rl_runtime_state()

@@ -15,6 +15,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
+from megatron.rl.prefix_tree_merging_utils import log_dummy_prefix_tree_path
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -265,6 +266,15 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
+    prefix_tree_context = runtime_state.prefix_tree_context if args.prefix_tree_merging else None
+
+    if prefix_tree_context is not None:
+        log_dummy_prefix_tree_path(
+            stage="train-forward-batch",
+            context=prefix_tree_context,
+            tokens=tokens,
+            position_ids=position_ids,
+        )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
@@ -279,7 +289,13 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         current_logprobs = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False
+            model_to_use,
+            tokens,
+            position_ids,
+            attention_mask,
+            no_grad=False,
+            prefix_tree_context=prefix_tree_context,
+            prefix_tree_stage="train-forward",
         )
 
         # Calculate loss using unified function

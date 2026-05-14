@@ -29,6 +29,11 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 try:
+    from megatron.rl import rl_utils
+    has_rl_utils = True
+except ImportError:
+    has_rl_utils = False
+try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
     )
@@ -864,13 +869,19 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        evaluate_and_print_results(
-            prefix, forward_step_func,
-            valid_data_iterator, model,
-            iteration, process_non_loss_data_func, config,
-            verbose=True, write_to_tensorboard=not args.skip_train,
-            non_loss_data_func=non_loss_data_func
-        )
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.evaluate_and_print_results_rl(
+                valid_data_iterator, model, optimizer,
+                iteration, write_to_tensorboard=not args.skip_train
+            )
+        else:
+            evaluate_and_print_results(
+                prefix, forward_step_func,
+                valid_data_iterator, model,
+                iteration, process_non_loss_data_func, config,
+                verbose=True, write_to_tensorboard=not args.skip_train,
+                non_loss_data_func=non_loss_data_func
+            )
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
@@ -898,6 +909,9 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
+
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.rl_inference_interface_shutdown()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -1570,6 +1584,17 @@ def training_log(
             'backward-send-backward-recv',
             'forward-backward-send-forward-backward-recv',
         ])
+    # Add timers from RL loop if needed.
+    if getattr(args, 'perform_rl_step', False):
+        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
+                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
+                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
+                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
+                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
+                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
+                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
+                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
 
@@ -1596,6 +1621,13 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
+        # Log bins for packed mode
+        if has_rl_utils and args.rl_use_sequence_packing:
+            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
+            for metric_name, metric_value in packing_metrics.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+            if wandb_writer and packing_metrics:
+                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
@@ -1628,6 +1660,11 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if getattr(args, 'perform_rl_step', False):
+            grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
+            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
+            if wandb_writer:
+                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1715,6 +1752,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        if has_rl_utils and args.rl_use_sequence_packing:
+            log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -2079,6 +2118,65 @@ def train(
     args = get_args()
     timers = get_timers()
 
+    if getattr(args, 'perform_rl_step', False):
+        assert has_rl_utils, "RL cannot run without the megatron.rl package"
+
+    # Additional variable initialization for RL training
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
+        load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
+        args.no_load_optim = True
+
+        # Load pretrained checkpoint
+        args.load = None
+        args.finetune = True
+        load_checkpoint(
+                model,
+                None,  # Don't load optimizer state
+                None,  # Don't load scheduler state
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+        ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+
+        # Reload RL training checkpoint weights
+        args.load = load
+        args.finetune = finetune
+        print_rank_0("> Reloading RL training checkpoint...")
+        load_checkpoint(
+                model,
+                None,
+                None,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
+
+        args.no_load_optim = no_load_optim
+
+    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
+    if getattr(args, 'perform_rl_step', False):
+        print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator
+        )
+        # First destroy the existing calculator
+        destroy_num_microbatches_calculator()
+        # Then initialize with the correct perform_rl_step=True context
+        init_num_microbatches_calculator(
+            args.rank,
+            args.rampup_batch_size,
+            args.global_batch_size,
+            args.micro_batch_size,
+            mpu.get_data_parallel_world_size(),
+            args.decrease_batch_size_if_needed
+        )
+        print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
+
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
@@ -2268,6 +2366,7 @@ def train(
         )
 
     # Run training iterations till done.
+    buffered_rollouts = None
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
@@ -2294,22 +2393,31 @@ def train(
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
+        # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
+        # Skip automatic checkpoint on microbatch changes when sequence packing is active
+        # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            assert get_num_microbatches() > num_microbatches, (
-                f"Number of microbatches should be increasing due to batch size rampup; "
-                f"instead going from {num_microbatches} to {get_num_microbatches()}"
-            )
-            if args.save is not None:
-                save_checkpoint_and_time(
-                    iteration,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    num_floating_point_operations_so_far,
-                    checkpointing_context,
-                    train_data_iterator=train_data_iterator,
+            if args.rl_use_sequence_packing:
+                print_rank_0(
+                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
+                    f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
+            else:
+                assert get_num_microbatches() > num_microbatches, (
+                    f"Number of microbatches should be increasing due to batch size rampup; "
+                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                )
+                if args.save is not None:
+                    save_checkpoint_and_time(
+                        iteration,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        num_floating_point_operations_so_far,
+                        checkpointing_context,
+                        train_data_iterator=train_data_iterator,
+                    )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -2341,6 +2449,22 @@ def train(
             continue
 
         args.curr_iteration = iteration
+        # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
+        # It is similar to a PPO epoch.
+
+        if getattr(args, 'perform_rl_step', False):
+            with torch.no_grad():
+                train_data_iterator = rl_utils.setup_grpo_data_iterator(
+                    model,
+                    optimizer,
+                    iteration,
+                    ref_state_dict,
+                    prefix_tree_merging=args.prefix_tree_merging,
+                    buffered_rollouts=buffered_rollouts,
+                )
+                # Buffered rollouts are used as a state container for setups when
+                # we use previously-generated data for an update.
+                buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
         (
@@ -2398,10 +2522,15 @@ def train(
 
         iteration += 1
 
-        batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-        )
-        iteration_sequences = batch_size
+        if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
+            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
+            # Track bins separately for packed mode
+            rl_utils.update_sequence_packing_metrics(args)
+        else:
+            batch_size = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            iteration_sequences = batch_size
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
@@ -2464,11 +2593,15 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            evaluate_and_print_results(prefix, forward_step_func,
-                                   valid_data_iterator, model,
-                                   iteration, process_non_loss_data_func,
-                                   config, verbose=False, write_to_tensorboard=True,
-                                   non_loss_data_func=non_loss_data_func)
+            if getattr(args, 'perform_rl_step', False):
+                rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                                       iteration, write_to_tensorboard=True)
+            else:
+                evaluate_and_print_results(prefix, forward_step_func,
+                                       valid_data_iterator, model,
+                                       iteration, process_non_loss_data_func,
+                                       config, verbose=False, write_to_tensorboard=True,
+                                       non_loss_data_func=non_loss_data_func)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -2547,6 +2680,8 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
+        if getattr(args, 'perform_rl_step', False):
+            rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -2868,29 +3003,38 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets and dataloders.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            build_train_valid_test_datasets_provider,
-            vp_stage=vp_stage,
-        )
-        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        if not args.skip_train:
-            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
-        valid_dataloaders = []
-        for valid_d in valid_ds:
-            if args.skip_train or args.full_validation:
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-            else:
-                if args.multiple_validation_sets:
-                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                    # correct and needs to be calculated/set per validation set
-                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-        if not args.multiple_validation_sets:
-            assert len(valid_dataloaders) == 1
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
-        do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+        if getattr(args, 'perform_rl_step', True):
+            # we don't need to build any dataloaders for RL training
+            train_dataloader = None
+            valid_dataloaders = None
+            test_dataloader = None
+            do_train = args.train_iters > 0
+            do_valid = (args.full_validation or args.eval_iters > 0)
+            do_test = (args.full_validation or args.eval_iters > 0)
+        else:
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider,
+                vp_stage=vp_stage,
+            )
+            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            if not args.skip_train:
+                train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+            valid_dataloaders = []
+            for valid_d in valid_ds:
+                if args.skip_train or args.full_validation:
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                else:
+                    if args.multiple_validation_sets:
+                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                        # correct and needs to be calculated/set per validation set
+                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+            if not args.multiple_validation_sets:
+                assert len(valid_dataloaders) == 1
+            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            do_train = train_dataloader is not None and args.train_iters > 0
+            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
@@ -2903,6 +3047,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    if getattr(args, 'perform_rl_step', False):
+        args.to_test = False
+
     return train_dataloader, valid_dataloaders, test_dataloader
 
 

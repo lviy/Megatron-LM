@@ -310,11 +310,7 @@ def apply_rotary_pos_emb(
         force_unfused = True
 
     # Keep for backward compatibility. Will deprecate in the future.
-    # For PTM+Magi local THD streams we intentionally pass cp_group=None to
-    # disable native zigzag CP slicing. Re-populating the global CP group here
-    # would reinterpret a local packed stream as a CP-sharded global stream and
-    # corrupt THD RoPE sequence boundaries.
-    if cp_group is None and not explicit_position_ids and (cu_seqlens is None or not force_unfused):
+    if cp_group is None and (cu_seqlens is None or not force_unfused):
         cp_group = parallel_state.get_context_parallel_group()
 
     if config.apply_rope_fusion and not force_unfused:

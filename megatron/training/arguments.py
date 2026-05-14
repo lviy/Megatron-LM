@@ -56,6 +56,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_network_size_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
+    parser = _add_rl_args(parser)
     parser = _add_initialization_args(parser)
     parser = _add_learning_rate_args(parser)
     parser = _add_checkpointing_args(parser)
@@ -428,6 +429,44 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
+    # Batch size checks if running RL.
+    if args.perform_rl_step:
+        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
+            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+
+        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
+            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+
+        args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
+        num_generated_samples_per_inference_iteration = (
+            args.grpo_samples_per_iteration * args.grpo_iterations)
+
+        # Ensure that the number of prompts we collect is a multiple of the global batch size.
+        # TODO: Make this account for batch size rampup?
+        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
+            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
+
+        # For now only exit/checkpoint on iterations where we generate data. We don't currently
+        # have a way to checkpoint the generated data.
+        num_training_iterations_per_inference_iteration = (
+            num_generated_samples_per_inference_iteration // args.global_batch_size)
+        if args.exit_interval is not None:
+            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"exit_interval should be divisible by number of global batches per inference iteration."
+        if args.save_interval is not None:
+            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"save_interval should be divisible by number of global batches per inference iteration."
+        if args.rl_use_sequence_packing:
+            assert args.seq_length <= args.rl_sequence_packing_bin_size, \
+                f"rl_sequence_packing_bin_size should be larger than or equal to seq_length"
+        assert not (args.rl_use_sequence_packing and args.prefix_tree_merging), (
+            "--prefix-tree-merging is currently wired only for the unpacked RL path; "
+            "do not enable it together with --rl-use-sequence-packing."
+        )
+
+    if args.prefix_tree_merging:
+        assert args.perform_rl_step, "--prefix-tree-merging is currently only supported with --perform-rl-step"
+
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
@@ -784,6 +823,9 @@ def validate_args(args, defaults={}):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
+    if args.rl_use_sequence_packing:
+        args.consumed_train_bins = 0
+
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
     # across batches/microbatches. Due to additional communication overhead
@@ -2040,6 +2082,75 @@ def _add_regularization_args(parser):
 
     return parser
 
+
+def _add_rl_args(parser):
+    group = parser.add_argument_group(title='rl')
+    group.add_argument('--perform-rl-step', action='store_true',
+                       help="Use the RL training step.")
+    group.add_argument('--rl-prompts-per-eval', type=int, default=32,
+                       help='Number of prompts to evaluate for for each RL task.'
+                        'This evaluation can be very expensive when using environments' 
+                        'that evaluate pass@k so we default to a lower number.')
+    # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
+    group.add_argument('--grpo-prompts-per-step', type=int, default=32,
+                       help="Number of GRPO groups (G in the paper).")
+    group.add_argument('--grpo-group-size', type=int, default=2,
+                       help="Number of samples per a GRPO group.")
+    group.add_argument('--grpo-iterations', type=int, default=2,
+                       help="Number of iterations per a GRPO implementation.")
+    # As in DAPO, we keep upper/lower eps different.
+    # To have a vanilla GRPO, set them to be the same.
+    group.add_argument('--grpo-clamp-eps-lower', type=float, default=0.01,
+                       help="Lower GRPO clipping bound.")
+    group.add_argument('--grpo-clamp-eps-upper', type=float, default=0.01,
+                       help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
+    group.add_argument('--grpo-kl-beta', type=float, default=0.001,
+                       help="KL term weight in the GRPO loss.")
+    group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
+                       help="Entropy term weight in GRPO loss.")
+    group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
+                       help="Filter groups with same reward.")
+    group.add_argument('--grpo-default-temperature', type=float, default=1.0,
+                       help="Default temperature for model inference.")
+    group.add_argument('--grpo-default-top-p', type=float, default=0,
+                       help="Default top-p for model inference.")
+    group.add_argument('--langrl-inference-server-type', type=str,
+                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
+                       help="Type of inference server to use.")
+    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
+                       help="Conversation template, if using a chat server.")
+    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
+    group.add_argument('--langrl-env-config', type=str, default=None,
+                       help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
+                       help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
+    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Offload KV cache to CPU during training to save GPU memory')
+    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
+                       help='Remove KV cache during training to save GPU memory')
+    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, use partial rollouts.')
+    group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
+                       help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
+                       help='If set, calculate the intra-group similarity of rollouts.')
+    group.add_argument('--prefix-tree-merging', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Enable the Prefix Tree Merging RL control-flow path. '
+                            'Current implementation is dummy wiring only and logs when the path is exercised.')
+    group.add_argument('--rl-use-sequence-packing', action='store_true',
+                       help='Enable sequence packing')
+    group.add_argument('--rl-sequence-packing-bin-size', type=int, default=8192,
+                       help='Override bin size for sequence packing.')
+    group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
+                       choices=['fifo', 'round-robin'],
+                       help='Algorithm for distributing packed bins across ranks. '
+                            'fifo: first-in-first-out sequential distribution, '
+                            'round-robin: distribute bins cyclically across ranks for better load balancing')
+    return parser
 
 def _add_training_args(parser):
     from megatron.training.config import TrainingConfig
